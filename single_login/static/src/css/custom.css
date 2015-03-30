@@ -1,0 +1,6 @@
+@charset "UTF-8";
+
+/* Hides "Your odoo is not supported" message */
+#announcement_bar_table {
+  display: none !important;
+}

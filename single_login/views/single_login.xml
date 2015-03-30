@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<openerp>
+<data>
+
+<template id="assets_backend" name="single_login assets" inherit_id="web.assets_backend">
+	<xpath expr="." position="inside">
+		<link rel="stylesheet" href="/single_login/static/src/css/custom.css"/>
+		<script type="text/javascript" src="/single_login/static/src/js/custom.js"></script>
+	</xpath>
+</template>
+
+</data>
+</openerp>
