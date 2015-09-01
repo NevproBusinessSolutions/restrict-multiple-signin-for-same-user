@@ -23,81 +23,32 @@
 
 import logging
 import openerp
+from openerp import pooler, tools
 from openerp.osv import fields, osv, orm
 from datetime import date,datetime,time,timedelta
-from openerp import SUPERUSER_ID
-from openerp.http import request
 from openerp.tools.translate import _
-from openerp.http import Response
-from openerp import http
+from openerp import SUPERUSER_ID
+from openerp.addons.web import http
+from openerp.addons.web.controllers import main as openerp_main
 
 _logger = logging.getLogger(__name__)
 
 
-class Home(openerp.addons.web.controllers.main.Home):
-	@http.route('/web/login', type='http', auth="none")
-	def web_login(self, redirect=None, **kw):
-		openerp.addons.web.controllers.main.ensure_db()
-		
-		if request.httprequest.method == 'GET' and redirect and request.session.uid:
-			return http.redirect_with_hash(redirect)
-		
-		if not request.uid:
-			request.uid = openerp.SUPERUSER_ID
-		
-		values = request.params.copy()
-		if not redirect:
-			redirect = '/web?' + request.httprequest.query_string
-		values['redirect'] = redirect
-		
-		try:
-			values['databases'] = http.db_list()
-		except openerp.exceptions.AccessDenied:
-			values['databases'] = None
-		
-		if request.httprequest.method == 'POST':
-			old_uid = request.uid
-			uid = request.session.authenticate(request.session.db, request.params['login'], request.params['password'])
-			if uid is not False:
-				return http.redirect_with_hash(redirect)
-			request.uid = old_uid
-			values['error'] = "Login failed due to one of the following reasons"
-			values['error2'] = "- Wrong login/password"
-			values['error3'] = "- User already logged in from another system"
-		return request.render('web.login', values)
+class Session(openerp_main.Session):
+	_cp_path = "/web/session"
 
-
-class Root_new(openerp.http.Root):
-	def get_response(self, httprequest, result, explicit_session):
-		if isinstance(result, Response) and result.is_qweb:
-			try:
-				result.flatten()
-			except(Exception), e:
-				if request.db:
-					result = request.registry['ir.http']._handle_exception(e)
-				else:
-					raise
+	@http.jsonrequest
+	def authenticate(self, req, db, login, password, sid=None, base_location=None):
+		wsgienv = req.httprequest.environ
+		env = dict(
+			base_location=base_location,
+			HTTP_HOST=wsgienv['HTTP_HOST'],
+			REMOTE_ADDR=wsgienv['REMOTE_ADDR'],
+			sid=sid,
+		)
+		req.session.authenticate(db, login, password, env)
 		
-		if isinstance(result, basestring):
-			response = Response(result, mimetype='text/html')
-		else:
-			response = result
-		
-		if httprequest.session.should_save:
-			self.session_store.save(httprequest.session)
-		# We must not set the cookie if the session id was specified using a http header or a GET parameter.
-		# There are two reasons to this:
-		# - When using one of those two means we consider that we are overriding the cookie, which means creating a new
-		#   session on top of an already existing session and we don't want to create a mess with the 'normal' session
-		#   (the one using the cookie). That is a special feature of the Session Javascript class.
-		# - It could allow session fixation attacks.
-		if not explicit_session and hasattr(response, 'set_cookie'):
-			response.set_cookie('session_id', httprequest.session.sid, max_age=2 * 60)
-		
-		return response
-
-root = Root_new()
-openerp.http.Root.get_response = root.get_response
+		return self.session_info(req)
 
 
 class res_users(osv.osv):
@@ -108,43 +59,64 @@ class res_users(osv.osv):
 		'expiration_date' : fields.datetime('Expiration Date'),
 		'logged_in': fields.boolean('Logged in'),
 		}
-	
-	def _login(self, db, login, password):
-		cr = self.pool.cursor()
-		cr.autocommit(True)
-		user_id = super(res_users,self)._login(db, login, password)
-		
-		try:
-			session_id = request.httprequest.session.sid
-			temp_browse = self.browse(cr, SUPERUSER_ID, user_id)
-			if isinstance(temp_browse, list): temp_browse = temp_browse[0]
-			exp_date = temp_browse.expiration_date
-			if exp_date and temp_browse.session_id:
-				exp_date = datetime.strptime(exp_date,"%Y-%m-%d %H:%M:%S")
-				if exp_date < datetime.utcnow() or temp_browse.session_id != session_id:
-					raise openerp.exceptions.AccessDenied()
-			self.save_session(cr,user_id)
-		except openerp.exceptions.AccessDenied:
-			user_id = False
-			_logger.warn("User %s is already logged in into the system!", login)
-			_logger.warn("Multiple sessions are not allowed for security reasons!")
-		finally:
-			cr.close()
-	
-		return user_id
 
+	def authenticate(self, db, login, password, user_agent_env):
+		"""Verifies and returns the user ID corresponding to the given 'login' and 'password' combination, or False if there was no matching user.
+			:param str db: the database on which user is trying to authenticate
+			:param str login: username
+			:param str password: user password
+			:param dict user_agent_env: environment dictionary describing any relevant environment attributes
+		"""
+		uid = self.login(db, login, password)
+		if uid:
+			sid = user_agent_env.get('sid')
+			cr = pooler.get_db(db).cursor()
+			result = self.check_session(cr, uid, sid)
+			cr.close()
+			if not result:
+				return False
+		if uid == openerp.SUPERUSER_ID:
+			# Successfully logged in as admin!
+			# Attempt to guess the web base url...
+			if user_agent_env and user_agent_env.get('base_location'):
+				cr = pooler.get_db(db).cursor()
+				try:
+					base = user_agent_env['base_location']
+					ICP = self.pool.get('ir.config_parameter')
+					if not ICP.get_param(cr, uid, 'web.base.url.freeze'):
+						ICP.set_param(cr, uid, 'web.base.url', base)
+					cr.commit()
+				except Exception:
+					_logger.exception("Failed to update web.base.url configuration parameter")
+				finally:
+					cr.close()
+		return uid
+
+	#checks is user in already logged in into the system
+	def check_session(self, cr, user_id, session_id):
+		res = True
+		if isinstance(user_id, list): user_id = user_id[0]
+		user_data = self.browse(cr, SUPERUSER_ID, user_id)
+		if user_data.expiration_date:
+			exp_date = datetime.strptime(user_data.expiration_date,"%Y-%m-%d %H:%M:%S")
+			if exp_date < datetime.utcnow()  or user_data.session_id != session_id:
+				res = False
+		return res
 
 	#clears session_id and session expiry from res.users
 	def clear_session(self, cr, user_id):
 		if isinstance(user_id, list): user_id = user_id[0]
+		# cr.execute("UPDATE res_users SET session_id = '', expiration_date = NULL, logged_in = False WHERE id = %s",(user_id,))
 		self.write(cr, SUPERUSER_ID, user_id, {'session_id':'','expiration_date':False,'logged_in':False})
+		return True
 
 	#insert session_id and session expiry into res.users
-	def save_session(self, cr, user_id):
+	def save_session(self, cr, user_id, sid):
 		if isinstance(user_id, list): user_id = user_id[0]
 		exp_date = datetime.utcnow() + timedelta(minutes=2)
-		sid = request.httprequest.session.sid
-		self.write(cr, SUPERUSER_ID, user_id, {'session_id':sid,'expiration_date':exp_date,'logged_in':True})
+		exp_date = exp_date.strftime("%Y-%m-%d %H:%M:%S")
+		self.write(cr, SUPERUSER_ID, user_id, {'session_id':sid, 'expiration_date':exp_date, 'logged_in':True})
+		return True
 
 	#schedular function to validate users session
 	def validate_sessions(self, cr, uid):
